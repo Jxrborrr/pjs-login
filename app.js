@@ -65,7 +65,7 @@ app.post('/register', jsonParser, function (req, res) {
       }
     )
   })
-})
+});
 
 app.post('/login', jsonParser, function (req, res) {
   const { email, password } = req.body || {}
@@ -123,7 +123,7 @@ app.post('/login', jsonParser, function (req, res) {
       })
     }
   )
-})
+});
 
 app.post('/authen', jsonParser, function (req, res) {
   try {
@@ -133,7 +133,7 @@ app.post('/authen', jsonParser, function (req, res) {
   } catch (err) {
     res.json({ status: 'error', message: err.message })
   }
-})
+});
 
 app.get('/me', auth, function (req, res) {
   const email = req.user.email
@@ -162,15 +162,39 @@ app.get('/me', auth, function (req, res) {
       })
     }
   )
-})
+});
 
-app.post('/bookings', auth, jsonParser, (req, res) => {
+app.get("/rooms", (req, res) => {
+  const sql = `
+    SELECT 
+      id,
+      room_number AS name,
+      room_type AS type,
+      city,
+      price_per_night AS pricePerNight,
+      total_rooms,
+      status
+    FROM rooms
+    WHERE status = 'available'
+  `;
+
+  connection.execute(sql, (err, rows) => {
+    if (err) {
+      console.error("ROOMS ERR:", err);
+      return res.status(500).json({ status: "error", message: "db error" });
+    }
+
+    res.json({ status: "ok", rooms: rows });
+  });
+});
+
+app.post("/bookings", auth, jsonParser, (req, res) => {
   const userId = req.user.id;
   const {
     roomId,
     roomName,
     city,
-    roomType,
+    roomType,      
     pricePerNight,
     rooms,
     nights,
@@ -179,55 +203,105 @@ app.post('/bookings', auth, jsonParser, (req, res) => {
     adults,
     children,
     totalPrice,
-    booking_code,
+    booking_code
   } = req.body || {};
 
   if (!roomId || !checkIn || !checkOut || !totalPrice) {
     return res
       .status(400)
-      .json({ status: 'error', message: 'missing required fields' });
+      .json({ status: "error", message: "missing required fields" });
   }
-  const sql = `
-    INSERT INTO bookings
-      (user_id, room_id, room_name, city, room_type,
-       price_per_night, rooms, nights,
-       check_in, check_out,
-       adults, children,
-       total_price, booking_code, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `;
 
   connection.execute(
-    sql,
-    [
-      userId,
-      roomId,
-      roomName,
-      city,
-      roomType,
-      pricePerNight,
-      rooms,
-      nights,
-      checkIn,
-      checkOut,
-      adults,
-      children,
-      totalPrice,
-      booking_code,
-      'pending',
-    ],
-    (err, result) => {
+    "SELECT total_rooms FROM rooms WHERE id = ?",
+    [roomId],
+    (err, roomRows) => {
       if (err) {
-        console.error('CREATE BOOKING ERR:', err);
+        console.error("ROOM CHECK ERR:", err);
         return res
           .status(500)
-          .json({ status: 'error', message: 'db error' });
+          .json({ status: "error", message: "db error" });
       }
 
-      res.json({
-        status: 'ok',
-        bookingId: result.insertId,
-      });
+      if (!roomRows || roomRows.length === 0) {
+        return res.json({ status: "error", message: "Room not found" });
+      }
+
+      const totalRooms = roomRows[0].total_rooms;
+
+      connection.execute(
+        `SELECT COUNT(*) AS booked
+         FROM bookings
+         WHERE room_id = ?
+           AND status = 'confirmed'
+           AND (
+                (check_in <= ? AND check_out > ?) OR
+                (check_in < ? AND check_out >= ?) OR
+                (check_in >= ? AND check_out <= ?)
+           )`,
+        [roomId, checkOut, checkIn, checkOut, checkIn, checkIn, checkOut],
+        (err2, result) => {
+          if (err2) {
+            console.error("BOOKED COUNT ERR:", err2);
+            return res
+              .status(500)
+              .json({ status: "error", message: "db error" });
+          }
+
+          const booked = result[0].booked;
+
+          if (booked >= totalRooms) {
+            return res.json({
+              status: "full",
+              message: "This room is fully booked for the selected dates."
+            });
+          }
+
+          const sql = `
+            INSERT INTO bookings
+              (user_id, room_id, room_name, city, room_type,
+               price_per_night, rooms, nights,
+               check_in, check_out,
+               adults, children,
+               total_price, booking_code, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `;
+
+          connection.execute(
+            sql,
+            [
+              userId,
+              roomId,
+              roomName,
+              city,
+              roomType,
+              pricePerNight,
+              rooms,
+              nights,
+              checkIn,
+              checkOut,
+              adults,
+              children,
+              totalPrice,
+              booking_code,
+              "confirmed"   
+            ],
+            (err3, result2) => {
+              if (err3) {
+                console.error("CREATE BOOKING ERR:", err3);
+                return res
+                  .status(500)
+                  .json({ status: "error", message: "db error" });
+              }
+
+              res.json({
+                status: "ok",
+                bookingId: result2.insertId
+              });
+            }
+          );
+        }
+      );
     }
   );
 });
@@ -257,6 +331,114 @@ app.get('/my-bookings', auth, (req, res) => {
 
     res.json({ status: 'ok', bookings: rows });
   });
+});
+
+app.post("/my-bookings", auth, (req, res) => {
+  const {
+    roomId,
+    roomName,
+    city,
+    type,
+    pricePerNight,
+    rooms,
+    nights,
+    checkIn,
+    checkOut,
+    adults,
+    children,
+    totalPrice,
+    booking_code
+  } = req.body;
+
+  connection.execute(
+    "SELECT total_rooms FROM rooms WHERE id = ?",
+    [roomId],
+    (err, roomRows) => {
+      if (err) return res.status(500).json({ status: "error", message: err });
+
+      if (roomRows.length === 0)
+        return res.json({ status: "error", message: "Room not found" });
+
+      const totalRooms = roomRows[0].total_rooms;
+
+      connection.execute(
+        `SELECT COUNT(*) AS booked
+         FROM bookings
+         WHERE room_id = ?
+           AND status = 'confirmed'
+           AND (
+                (check_in <= ? AND check_out > ?) OR
+                (check_in < ? AND check_out >= ?) OR
+                (check_in >= ? AND check_out <= ?)
+           )`,
+        [roomId, checkOut, checkIn, checkOut, checkIn, checkIn, checkOut],
+        (err, result) => {
+          if (err)
+            return res.status(500).json({ status: "error", message: err });
+
+          const booked = result[0].booked;
+
+          if (booked >= totalRooms) {
+            return res.json({
+              status: "full",
+              message: "This room is fully booked for the selected dates."
+            });
+          }
+
+          connection.execute(
+            `INSERT INTO bookings 
+             (room_id, room_name, city, room_type, price_per_night, rooms, nights,
+              check_in, check_out, adults, children, total_price, user_id, booking_code, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed')`,
+            [
+              roomId,
+              roomName,
+              city,
+              type,
+              pricePerNight,
+              rooms,
+              nights,
+              checkIn,
+              checkOut,
+              adults,
+              children,
+              totalPrice,
+              req.user.id,
+              booking_code
+            ],
+            (err) => {
+              if (err)
+                return res.status(500).json({ status: "error", message: err });
+
+              res.json({ status: "ok", message: "Booking successful." });
+            }
+          );
+        }
+      );
+    }
+  );
+});
+
+app.delete('/my-bookings/:id', auth, (req, res) => {
+  const bookingId = req.params.id;
+  const userId = req.user.id;
+
+  connection.execute(
+    "DELETE FROM bookings WHERE id = ? AND user_id = ?",
+    [bookingId, userId],
+    (err, result) => {
+      if (err) {
+        console.error(err);
+        return res.status(500).json({ status: "error", message: "Database error" });
+      }
+
+      if (result.affectedRows === 0) {
+        return res.status(404).json({ status: "error", message: "Booking not found" });
+      }
+
+      return res.json({ status: "ok", message: "Booking cancelled" });
+    }
+  );
 });
 
 app.get('/admin/rooms', auth, requireAdmin, (req, res) => {
@@ -384,7 +566,7 @@ app.post('/admin/rooms', auth, jsonParser, (req, res) => {
       );
     }
   );
-})
+});
 
 app.get('/admin/bookings', auth, (req, res) => {
   const email = req.user.email;
@@ -426,7 +608,7 @@ app.get('/admin/bookings', auth, (req, res) => {
       });
     }
   );
-})
+});
 
 app.put('/admin/bookings/:id/status', auth, (req, res) => {
   const email = req.user.email;
